@@ -93,6 +93,8 @@ export class ReplyCard implements ReplyCardSink {
   get bodyText() { return this.body; }
   private cardkit: CardKitStream | undefined;
   private fallbackCardId: string | undefined;
+  // [patch:quoted-card-recall] CardKit 流式卡片的出站消息 id（被引用时用它回填正文）
+  private cardkitMessageId: string | undefined;
   private readonly streamOpts: ReturnType<typeof resolveStreamOptions>;
   private readonly key: string;
   private readonly replyToMessageId: string;
@@ -111,7 +113,8 @@ export class ReplyCard implements ReplyCardSink {
   }
 
   get messageId() {
-    return this.fallbackCardId;
+    // [patch:quoted-card-recall] 流式路径下没有 fallbackCardId，必须回落到 CardKit 的回传 id
+    return this.cardkitMessageId ?? this.fallbackCardId;
   }
 
   async start() {
@@ -141,7 +144,11 @@ export class ReplyCard implements ReplyCardSink {
           pushIntervalMs: this.streamOpts.pushIntervalMs,
           conversationKey: this.key,
           runId: this.runId,
-          onOutboundMessageId: (id) => this.transport.rememberOutboundMessageId?.(id),
+          // [patch:quoted-card-recall] 记下出站卡片 id：引用回填与 groupAlsoOnReply 都要用
+          onOutboundMessageId: (id) => {
+            this.cardkitMessageId = id;
+            this.transport.rememberOutboundMessageId?.(id);
+          },
         },
       );
       debugLog("feishu.reply_card.cardkit_ready", {

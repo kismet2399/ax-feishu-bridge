@@ -110,6 +110,7 @@ export const DEFAULT_CONFIG: Pick<
   | "autoStart"
   | "parseInteractiveCards"
   | "includeQuotedMessage"
+  | "includeMergeForwardMessage" // [patch:merge-forward-expand]
   | "quotedMessageMaxChars"
   | "promptNotifySec"
   | "promptTimeoutSec"
@@ -138,6 +139,7 @@ export const DEFAULT_CONFIG: Pick<
   autoStart: true,
   parseInteractiveCards: true,
   includeQuotedMessage: true,
+  includeMergeForwardMessage: true, // [patch:merge-forward-expand]
   quotedMessageMaxChars: 8000,
   promptNotifySec: 180,
   promptTimeoutSec: 0,
@@ -248,6 +250,7 @@ function applyRuntimeDefaults(cfg: FeishuConfig): FeishuConfig {
     ignoreBotMessages: cfg.ignoreBotMessages ?? DEFAULT_CONFIG.ignoreBotMessages,
     parseInteractiveCards: cfg.parseInteractiveCards ?? DEFAULT_CONFIG.parseInteractiveCards,
     includeQuotedMessage: cfg.includeQuotedMessage ?? DEFAULT_CONFIG.includeQuotedMessage,
+    includeMergeForwardMessage: cfg.includeMergeForwardMessage ?? DEFAULT_CONFIG.includeMergeForwardMessage, // [patch:merge-forward-expand]
     quotedMessageMaxChars: cfg.quotedMessageMaxChars ?? DEFAULT_CONFIG.quotedMessageMaxChars,
     promptNotifySec: numberOr(cfg.promptNotifySec, DEFAULT_CONFIG.promptNotifySec!),
     promptTimeoutSec: numberOr(cfg.promptTimeoutSec, DEFAULT_CONFIG.promptTimeoutSec!),
@@ -280,6 +283,8 @@ export function loadBaseConfig(): FeishuConfig | undefined {
     return applyRuntimeDefaults({
       appId: envAppId,
       appSecret: envSecret,
+      // [patch:default-workspace] 允许用 FEISHU_DEFAULT_WORKSPACE 覆盖默认工作区
+      defaultWorkspace: env("DEFAULT_WORKSPACE")?.trim() || undefined,
       domain: (env("DOMAIN") as Domain) || DEFAULT_CONFIG.domain,
       groupPolicy: (env("GROUP_POLICY") as GroupPolicy) || DEFAULT_CONFIG.groupPolicy,
       groupKeywords: parseGroupKeywords(env("GROUP_KEYWORDS")),
@@ -294,6 +299,7 @@ export function loadBaseConfig(): FeishuConfig | undefined {
       autoStart: env("AUTO_START") ? env("AUTO_START") !== "0" : DEFAULT_CONFIG.autoStart,
       parseInteractiveCards: parseBool(env("PARSE_INTERACTIVE_CARDS"), DEFAULT_CONFIG.parseInteractiveCards!),
       includeQuotedMessage: parseBool(env("INCLUDE_QUOTED_MESSAGE"), DEFAULT_CONFIG.includeQuotedMessage!),
+      includeMergeForwardMessage: parseBool(env("INCLUDE_MERGE_FORWARD_MESSAGE"), DEFAULT_CONFIG.includeMergeForwardMessage!), // [patch:merge-forward-expand]
       quotedMessageMaxChars: parsePositiveInt(env("QUOTED_MESSAGE_MAX_CHARS"), DEFAULT_CONFIG.quotedMessageMaxChars!),
       promptNotifySec: parseEnvSeconds(env("PROMPT_NOTIFY_SEC")) ?? DEFAULT_CONFIG.promptNotifySec!,
       promptTimeoutSec: parseEnvSeconds(env("PROMPT_TIMEOUT_SEC")) ?? DEFAULT_CONFIG.promptTimeoutSec!,
@@ -314,6 +320,10 @@ export function loadBaseConfig(): FeishuConfig | undefined {
   return applyRuntimeDefaults({
     appId: cfg.appId,
     appSecret: cfg.appSecret,
+    // [patch:default-workspace] 原本该字段被 loadBaseConfig 丢弃，导致永远回退到 process.cwd()
+    defaultWorkspace: typeof cfg.defaultWorkspace === "string" && cfg.defaultWorkspace.trim()
+      ? cfg.defaultWorkspace.trim()
+      : undefined,
     domain: cfg.domain || DEFAULT_CONFIG.domain,
     groupPolicy: cfg.groupPolicy || DEFAULT_CONFIG.groupPolicy,
     groupKeywords: parseGroupKeywords(cfg.groupKeywords),
@@ -328,6 +338,7 @@ export function loadBaseConfig(): FeishuConfig | undefined {
     autoStart: cfg.autoStart ?? DEFAULT_CONFIG.autoStart,
     parseInteractiveCards: cfg.parseInteractiveCards,
     includeQuotedMessage: cfg.includeQuotedMessage,
+    includeMergeForwardMessage: cfg.includeMergeForwardMessage, // [patch:merge-forward-expand]
     quotedMessageMaxChars: cfg.quotedMessageMaxChars,
     promptNotifySec: numberOr(cfg.promptNotifySec, DEFAULT_CONFIG.promptNotifySec!),
     promptTimeoutSec: numberOr(cfg.promptTimeoutSec, DEFAULT_CONFIG.promptTimeoutSec!),

@@ -1,4 +1,5 @@
-import type { FeishuCardAction, FeishuConfig, FeishuMessage } from "./types.ts";
+// [patch:merge-forward-expand] 展开合并转发时，子消息附件要带归属消息 id
+import type { FeishuAttachment, FeishuCardAction, FeishuConfig, FeishuMessage } from "./types.ts";
 import { loadConfig } from "./config.ts";
 import { debugLog } from "./debug.ts";
 import {
@@ -7,10 +8,40 @@ import {
 } from "./group-trigger.ts";
 import { buildMarkdownCardParts, buildPostMessages, chooseMessageMode } from "./rich-text.ts";
 import { withRetry } from "./retry.ts";
-import { extractTextFromMsgType } from "./interactive-card.ts";
+// [patch:merge-forward-expand] 子消息可能是富文本，也可能只是读不回来的卡片占位
+import { extractTextFromMsgType, isUnreadableCardText, stripFeishuMarkup } from "./interactive-card.ts";
 import { FeishuCardActionWebhook } from "./card-action-webhook.ts";
 
 const TEXT_CHUNK_MAX_BYTES = 120 * 1024;
+// [patch:merge-forward-expand] 子消息快照 / 非文本类型标签 / 单条合并转发最多渲染的条数（飞书上限 50）
+type FeishuMessageSnapshot = {
+  messageId: string;
+  msgType: string;
+  content: string;
+  chatId?: string;
+  deleted?: boolean;
+  upperMessageId?: string;
+};
+
+const MERGE_FORWARD_TYPE_LABELS: Record<string, string> = {
+  image: "[图片]",
+  file: "[文件]",
+  audio: "[语音]",
+  media: "[视频]",
+  sticker: "[表情]",
+  share_chat: "[群名片]",
+  share_user: "[个人名片]",
+  location: "[位置]",
+  system: "[系统消息]",
+  calendar: "[日程]",
+  cloud_file: "[云文件]",
+  merge_forward: "[合并转发]",
+};
+
+const MERGE_FORWARD_MAX_CHILDREN = 50;
+
+/** 卡片正文回填钩子：transport 不持有 store，由调用方（message-handler）注入。 */
+export type CardAnswerResolver = (cardMessageId: string) => string | undefined;
 
 export class BotUnavailableError extends Error {
   constructor(message: string) {
@@ -527,15 +558,125 @@ export class FeishuTransport {
     }
   }
 
-  async getQuotedContext(msg: { parentId?: string; rootId?: string }, botOpenId?: string, maxChars = 8000) {
+  /** [patch:merge-forward-expand] messages.get 的完整 items：items[0] 是本体（合并转发时是哨兵），items[1:] 才是子消息。 */
+  async getMessageBundle(messageId: string): Promise<{ root?: FeishuMessageSnapshot; children: FeishuMessageSnapshot[] } | undefined> {
+    if (!messageId) return undefined;
+    try {
+      const res = await this.apiCall<any>("feishu.get_message", () =>
+        this.sdkClient.im.message.get({ path: { message_id: messageId } }),
+      );
+      const items: any[] = res?.data?.items || [];
+      const snapshots = items
+        .map((item) => {
+          const body = item?.body || item || {};
+          return {
+            messageId: String(body.message_id || item?.message_id || ""),
+            msgType: String(body.message_type || body.msg_type || item?.message_type || item?.msg_type || "unknown"),
+            content: typeof body.content === "string" ? body.content : JSON.stringify(body.content || {}),
+            chatId: body.chat_id || item?.chat_id,
+            deleted: Boolean(item?.deleted),
+            upperMessageId: item?.upper_message_id,
+          } as FeishuMessageSnapshot;
+        })
+        .filter((snapshot) => Boolean(snapshot.messageId));
+      if (!snapshots.length) return undefined;
+      const children = snapshots.slice(1).filter((child) => child.messageId !== snapshots[0].messageId);
+      return { root: snapshots[0], children };
+    } catch (error) {
+      debugLog("feishu.get_message_bundle.error", {
+        messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * 把合并转发的子消息渲染成编号清单；子消息附件带上容器（合并转发本体）的消息 id。
+   * 卡片子消息先用出站缓存回填正文，取不到就显式标注不可读 —— 绝不把升级提示当正文。
+   */
+  async expandMergeForward(
+    messageId: string,
+    botOpenId?: string,
+    maxChars = 8000,
+    resolveCardAnswer?: CardAnswerResolver,
+  ) {
+    if (loadConfig()?.includeMergeForwardMessage === false) {
+      debugLog("feishu.merge_forward.disabled", { messageId });
+      return { text: "", attachments: [] as FeishuAttachment[], childCount: 0 };
+    }
+    const bundle = await this.getMessageBundle(messageId);
+    const children = bundle?.children || [];
+    if (!children.length) {
+      debugLog("feishu.merge_forward.empty", { messageId });
+      return { text: "[合并转发消息：未能取到子消息内容]", attachments: [] as FeishuAttachment[], childCount: 0 };
+    }
+    const attachments: FeishuAttachment[] = [];
+    const lines: string[] = [];
+    const shown = children.slice(0, MERGE_FORWARD_MAX_CHILDREN);
+    for (const [index, child] of shown.entries()) {
+      if (child.deleted) {
+        lines.push(`${index + 1}) [已撤回]`);
+        continue;
+      }
+      const extracted = extractTextFromMsgType(child.msgType, child.content, botOpenId);
+      let body = extracted.text ? stripFeishuMarkup(extracted.text, botOpenId) : "";
+      if (child.msgType === "interactive") {
+        const cached = child.messageId ? resolveCardAnswer?.(child.messageId) : undefined;
+        if (cached?.trim()) {
+          body = `[卡片正文] ${cached.trim()}`;
+          debugLog("feishu.merge_forward.card_cache_hit", { messageId: child.messageId, length: cached.length });
+        } else if (isUnreadableCardText(body)) {
+          body = "[机器人卡片：正文无法读回]";
+          debugLog("feishu.merge_forward.card_unreadable", { messageId: child.messageId });
+        }
+      }
+      lines.push(`${index + 1}) ${body || MERGE_FORWARD_TYPE_LABELS[child.msgType] || `[${child.msgType}]`}`);
+      for (const attachment of extracted.attachments) {
+        attachments.push({ ...attachment, messageId });
+      }
+    }
+    if (children.length > shown.length) {
+      lines.push(`…另有 ${children.length - shown.length} 条未展开`);
+    }
+    const header = `[合并转发消息 · ${children.length} 条]`;
+    let text = `${header}\n${lines.join("\n")}`;
+    if (text.length > maxChars) text = `${text.slice(0, maxChars)}\n…(truncated)`;
+    debugLog("feishu.merge_forward.expanded", {
+      messageId,
+      childCount: children.length,
+      attachments: attachments.length,
+      textLength: text.length,
+    });
+    return { text, attachments, childCount: children.length };
+  }
+
+  async getQuotedContext(
+    msg: { parentId?: string; rootId?: string },
+    botOpenId?: string,
+    maxChars = 8000,
+    resolveCardAnswer?: CardAnswerResolver,
+  ) {
     const targetId = msg.parentId || msg.rootId;
     if (!targetId) return null;
     const parent = await this.getMessage(targetId);
     if (!parent) return null;
+    // [patch:merge-forward-expand] 被引用的本身是合并转发时，展开子消息，而不是把占位串当正文喂给模型
+    if (parent.msgType === "merge_forward") {
+      const expanded = await this.expandMergeForward(parent.messageId, botOpenId, maxChars, resolveCardAnswer);
+      return {
+        msgType: parent.msgType,
+        text: expanded.text,
+        attachments: expanded.attachments,
+        parentMessageId: parent.messageId,
+      };
+    }
     const extracted = extractTextFromMsgType(parent.msgType, parent.content, botOpenId);
     let text = extracted.text.trim();
     if (text.length > maxChars) text = `${text.slice(0, maxChars)}\n…(truncated)`;
-    return { msgType: parent.msgType, text, attachments: extracted.attachments };
+    // [patch:quoted-post] 回传父消息 id：引用附件的 file_key 只属于这条消息，
+    // 调用方必须用它去下载资源，否则飞书返回 400 code=234003 "File not in msg."。
+    return { msgType: parent.msgType, text, attachments: extracted.attachments, parentMessageId: parent.messageId };
   }
 
   async downloadMessageResource(messageId: string, fileKey: string, type: "image" | "file"): Promise<{ bytes: Buffer; mimeType?: string }> {

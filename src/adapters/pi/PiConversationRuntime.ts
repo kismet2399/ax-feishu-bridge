@@ -1,4 +1,6 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+// [patch:shadow-report-visible] 注入内容去重需要内容指纹
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import * as PiSdk from "@earendil-works/pi-coding-agent";
@@ -203,11 +205,12 @@ export class PiConversationRuntime implements ConversationRuntime {
       await onReply(message);
       return { status: "not_running", message };
     }
-    if (runId && active.runId && active.runId !== runId) {
-      const message = "这张任务卡片已不是当前进行中的任务。";
-      await onReply(message);
-      debugLog("feishu.prompt.stop_stale", { key, runId, activeRunId: active.runId });
-      return { status: "stale", message };
+    // [patch:stop-stale-takeover] 停止按钮往往属于「排队中的卡片」（它的 runId 是新的），而该会话真正在跑的
+    // 仍是 active。原行为只回一句 stale 就返回：一旦某轮任务卡死，用户反复点「停止」都无效，只能干等。
+    // 改为照常中止 active（同一会话同一时刻只有一个活动任务），并在成功分支说明停掉的是哪一条。
+    const takeover = Boolean(runId && active.runId && active.runId !== runId);
+    if (takeover) {
+      debugLog("feishu.prompt.stop_stale_takeover", { key, runId, activeRunId: active.runId });
     }
 
     active.stopped = true;
@@ -216,7 +219,7 @@ export class PiConversationRuntime implements ConversationRuntime {
     try {
       await active.session.abort();
       debugLog("feishu.prompt.abort", { key });
-      const message = "已停止";
+      const message = takeover ? "已停止上一条仍在处理中的任务（本卡片排在它之后）。" : "已停止";
       await onReply(message);
       return { status: "stopped", message, body };
     } catch (error) {
@@ -570,6 +573,20 @@ export class PiConversationRuntime implements ConversationRuntime {
     }
   }
 
+  /** [patch:shadow-report-visible] 把影子哨兵报告单独推一条给飞书（内容指纹去重）。 */
+  private forwardInjected(key: string, content: unknown) {
+    if (!this.bridge) return;
+    const text = typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content.map((part: any) => (part?.type === "text" ? String(part.text || "") : "")).join("")
+        : "";
+    if (!text.trim()) return;
+    const digest = createHash("sha1").update(text).digest("hex").slice(0, 16);
+    debugLog("feishu.pi.injected_forwarded", { key, length: text.length, digest });
+    this.bridge.notifyInjected(key, text, `injected:${digest}`);
+  }
+
   private previousTurn(key: string) {
     // Keep a conversation serial for as long as Pi needs. A bridge-side queue
     // timeout can start a second turn while the first is still streaming.
@@ -672,6 +689,12 @@ export class PiConversationRuntime implements ConversationRuntime {
         }
       }
       if (event.type === "message_end") {
+        // [patch:shadow-report-visible] 扩展注入的 custom_message 同样走 message_start/message_end，
+        // 在模型上下文里被当成 user 消息，但飞书侧此前收不到，用户只看到模型对它的回答。
+        const endedMessage = (event as any).message;
+        if (endedMessage?.customType === "shadow-report") {
+          this.forwardInjected(key, endedMessage.content);
+        }
         handlePiMessageEnd(this.bridge, session.sessionId, key, event.message);
       }
     });

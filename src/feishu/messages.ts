@@ -29,9 +29,15 @@ export function pruneRecentMap(map: Map<string, number>, now: number, ttlMs: num
 
 export function conversationKey(msg: FeishuMessage) {
   if (msg.chatType === "p2p") return `p2p:${msg.senderOpenId}`;
-  const threadId = msg.threadId || msg.rootId || msg.parentId;
-  if (threadId) return `group:${msg.chatId}:thread:${threadId}`;
-  if (msg.chatMode === "topic") return `group:${msg.chatId}:thread:${msg.messageId}`;
+  // [patch:group-session-key] 原来只要消息带 root_id/parent_id 就切到 thread:<root> 会话，
+  // 而非话题群里「引用回复」同样会带这两个字段，导致同一个群被拆成
+  // group:<chatId> 与 group:<chatId>:thread:<root> 两个互不通上下文的会话，
+  // 且每个新 root 都会新开一个空会话 —— 用户没敲 /new，却像换了个脑子。
+  // 只保留真正的「话题群」按话题根分会话（话题群里 threadId 天然存在，首条消息以自身为根）。
+  if (msg.chatMode === "topic") {
+    const root = msg.threadId || msg.rootId || msg.parentId || msg.messageId;
+    return `group:${msg.chatId}:thread:${root}`;
+  }
   return `group:${msg.chatId}`;
 }
 
@@ -151,12 +157,14 @@ export function getCommandList(): string {
 
 /** 合并用户文本与引用父消息，供 agent 调查告警卡片等场景 */
 export function buildPromptWithQuote(userText: string, quoted?: { msgType: string; text: string } | null): string {
-  if (!quoted?.text?.trim()) return userText;
+  // [patch:quoted-post] 无文字但带附件的引用（如纯图片）也要保留引用块，
+  // 否则 P2 建立起来的 quoted 会被这里直接丢掉。
+  if (!quoted) return userText;
   const blocks = [
     "[Quoted message]",
     `type: ${quoted.msgType}`,
     "---",
-    quoted.text.trim(),
+    quoted.text.trim() || "(no text)",
     "---",
     "[User]",
     userText || "(no text)",

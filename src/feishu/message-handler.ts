@@ -14,7 +14,8 @@ import { conversationKey, conversationLabel, buildPromptWithQuote, getCommandLis
 import { ReplyCard } from "./reply-card.ts";
 import type { FeishuBridgeStore } from "./bridge-store.ts";
 import type { FeishuTransport } from "./transport.ts";
-import type { FeishuMessage } from "./types.ts";
+// [patch:quoted-post] 引用附件独立通道需要 FeishuAttachment 类型
+import type { FeishuAttachment, FeishuMessage } from "./types.ts";
 
 const CONTENT_DEDUPE_TTL_MS = 5_000;
 
@@ -58,17 +59,53 @@ export class FeishuMessageHandler {
       const key = conversationKey(msg);
       this.bridgeStore?.bindConversation(key, msg);
 
+      // [patch:merge-forward-expand] 合并转发：本体 content 固定是 "Merged and Forwarded Message"，子消息在
+      // GET /im/v1/messages/:id 的 items[1:]（items[0] 是哨兵）。子消息里的资源不在子消息上，
+      // 而在容器（本体）消息上 → 附件统一按容器 id 下载。不展开的话模型只看到一句占位。
+      let mergedForwardAttachments: FeishuAttachment[] = [];
+      if (msg.msgType === "merge_forward") {
+        const expanded = await transport.expandMergeForward(
+          msg.messageId,
+          transport.getBotOpenId(),
+          cfg?.quotedMessageMaxChars ?? 8000,
+          (id) => this.bridgeStore?.getCardAnswer(id),
+        );
+        if (expanded.text) text = expanded.text;
+        mergedForwardAttachments = expanded.attachments;
+      }
+
       // 展开引用/回复的父消息（告警卡片场景）
       let quoted: { msgType: string; text: string } | null = null;
+      // [patch:quoted-post] 引用附件单独持有，绝不塞进 parsed.attachments —— 那里有两处消费者
+      // 都假设它是"本条消息自己的附件"：① handleCommand 闸门 if(!parsed.attachments.length)
+      // 会让斜杠命令静默失效；② 用 msg.messageId 下载会被飞书拒为 400 "File not in msg."。
+      let quotedRef: { messageId: string; attachments: FeishuAttachment[] } | null = null;
       if (cfg?.includeQuotedMessage !== false && (msg.parentId || msg.rootId)) {
+        // [patch:merge-forward-expand] 传入卡片正文回填钩子：被引用的合并转发里可能夹着机器人卡片
         const q = await transport.getQuotedContext(
           msg,
           transport.getBotOpenId(),
           cfg?.quotedMessageMaxChars ?? 8000,
+          (id) => this.bridgeStore?.getCardAnswer(id),
         );
-        if (q?.text) {
+        // [patch:quoted-post] 无文字的引用（如纯图片消息）原先被整体丢弃，改为文本或附件任一
+        // 存在即算有效引用；引用附件走 quotedRef，由 P5 用父消息 id 下载。
+        // [patch:quoted-card-recall] 被引用的若是我们自己的卡片，优先用出站记录里的正文：飞书对
+        // CardKit 卡片只回占位内容（"请升级至最新版本客户端"），照单全收会让模型完全
+        // 不知道用户在回应哪一条回答，只能顺着最近话题瞎猜。
+        const recalled = q?.parentMessageId ? this.bridgeStore?.getCardAnswer(q.parentMessageId) : undefined;
+        if (recalled?.trim()) {
+          quoted = { msgType: q?.msgType ?? "interactive", text: recalled };
+          debugLog("feishu.handler.quoted_card_recalled", {
+            messageId: msg.messageId,
+            parentMessageId: q?.parentMessageId,
+            length: recalled.length,
+          });
+        } else if (q?.text || q?.attachments?.length) {
           quoted = { msgType: q.msgType, text: q.text };
-          for (const a of q.attachments || []) parsed.attachments.push(a);
+          if (q.attachments?.length) {
+            quotedRef = { messageId: q.parentMessageId, attachments: q.attachments };
+          }
         }
       }
 
@@ -116,7 +153,21 @@ export class FeishuMessageHandler {
       });
 
       const processed = await this.processAttachments(msg, parsed.attachments, modelSupportsImage);
-      const { imageInputs, fileSections, downloadErrors, skippedImageCount } = processed;
+      // [patch:quoted-post] 引用附件必须用被引用父消息的 id 下载（否则 400 File not in msg.），
+      // 结果再与本条消息自身附件合并，统一交给下游送模型。
+      const quotedProcessed = quotedRef
+        ? await this.processAttachments(msg, quotedRef.attachments, modelSupportsImage, quotedRef.messageId)
+        : { imageInputs: [], fileSections: [], downloadErrors: [], skippedImageCount: 0 };
+      // [patch:merge-forward-expand] 合并转发子消息的附件：各自带归属 id，无需 resourceMessageId
+      const mergedForwardProcessed = mergedForwardAttachments.length
+        ? await this.processAttachments(msg, mergedForwardAttachments, modelSupportsImage)
+        : { imageInputs: [], fileSections: [], downloadErrors: [], skippedImageCount: 0 };
+      const { imageInputs, fileSections, downloadErrors, skippedImageCount } = {
+        imageInputs: [...processed.imageInputs, ...quotedProcessed.imageInputs, ...mergedForwardProcessed.imageInputs],
+        fileSections: [...processed.fileSections, ...quotedProcessed.fileSections, ...mergedForwardProcessed.fileSections],
+        downloadErrors: [...processed.downloadErrors, ...quotedProcessed.downloadErrors, ...mergedForwardProcessed.downloadErrors],
+        skippedImageCount: processed.skippedImageCount + quotedProcessed.skippedImageCount + mergedForwardProcessed.skippedImageCount,
+      };
 
       if (skippedImageCount > 0 && imageInputs.length === 0 && !fileSections.length && !text.trim()) {
         await transport.replyText(
@@ -150,7 +201,11 @@ export class FeishuMessageHandler {
         prompt,
         imageInputs,
         async (reply) => {
-          await card.completeWithAnswer(reply || "（无内容）");
+          const answer = reply || "（无内容）";
+          // [patch:quoted-card-recall] 先登记再收尾：用户随时可能引用这张卡片。
+          const cardMessageId = card.messageId;
+          if (cardMessageId) this.bridgeStore?.rememberCardAnswer(cardMessageId, answer);
+          await card.completeWithAnswer(answer);
         },
         card,
         useStreaming ? (delta) => card.append(delta) : undefined,
@@ -328,16 +383,24 @@ export class FeishuMessageHandler {
 
   private async processAttachments(
     msg: FeishuMessage,
-    attachments: Array<{ kind: "image" | "file"; fileKey: string; fileName?: string }>,
+    // [patch:merge-forward-expand] 改用 FeishuAttachment：附件可自带归属消息 id（合并转发子消息）
+    attachments: FeishuAttachment[],
     modelSupportsImage: boolean,
+    // [patch:quoted-post] 附件归属的消息 id。引用附件的 file_key 只属于被引用的父消息，
+    // 用当前消息 id 下载会被飞书拒绝（400 code=234003 File not in msg.）。
+    resourceMessageId?: string,
   ) {
     const transport = this.getTransport();
+    // [patch:merge-forward-expand] 附件优先用自己的归属消息 id，取不到才回落到本条/被引用消息
+    const fallbackDownloadMessageId = resourceMessageId ?? msg.messageId;
     const imageInputs: FeishuImageInput[] = [];
     const fileSections: string[] = [];
     const downloadErrors: string[] = [];
     let skippedImageCount = 0;
 
     for (const attachment of attachments) {
+      // [patch:merge-forward-expand] 每个附件用各自归属的消息 id 下载
+      const downloadMessageId = attachment.messageId ?? fallbackDownloadMessageId;
       if (attachment.kind === "image") {
         if (!modelSupportsImage) {
           skippedImageCount += 1;
@@ -349,7 +412,7 @@ export class FeishuMessageHandler {
         }
         try {
           const resource = await withTimeout(
-            transport.downloadImage(msg.messageId, attachment.fileKey),
+            transport.downloadImage(downloadMessageId, attachment.fileKey),
             15000,
             "图片下载超时",
           );
@@ -385,7 +448,7 @@ export class FeishuMessageHandler {
       }
       try {
         const resource = await withTimeout(
-          transport.downloadMessageResource(msg.messageId, attachment.fileKey, "file"),
+          transport.downloadMessageResource(downloadMessageId, attachment.fileKey, "file"),
           15000,
           `文件下载超时：${fileName}`,
         );

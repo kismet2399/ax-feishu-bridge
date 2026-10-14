@@ -112,6 +112,17 @@ export class FeishuBridgeRuntime {
     await this.deliverOnce(dedupeKey, route, text);
   }
 
+  /**
+   * [patch:shadow-report-visible] 把注入进会话的扩展内容（如影子哨兵报告）作为一条独立消息推给飞书。
+   * 这类 custom_message 既不经过 ReplyCard，也不在 prompt 运行期内，用户以前完全看不到，
+   * 只看到模型对它的回答 —— 表现为"话题莫名被带偏"。
+   */
+  notifyInjected(sessionKey: string, text: string, dedupeKey: string) {
+    const route = this.store.getRoute(sessionKey);
+    if (!route || !text.trim()) return;
+    void this.deliverOnce(dedupeKey, route, text.trim());
+  }
+
   private async deliverOnce(deliveryKey: string, route: any, text: string) {
     if (this.store.hasSent(deliveryKey)) return;
     try {

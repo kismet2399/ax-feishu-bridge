@@ -125,6 +125,17 @@ function readElementArrays(parsed: Record<string, unknown>): unknown[][] {
  * 将飞书 interactive 卡片 JSON 转为 agent 可读纯文本。
  * 失败时返回 fallback，避免静默丢消息。
  */
+/**
+ * [patch:merge-forward-expand] 飞书对 CardKit 卡片的引用只回一个"请升级至最新版本客户端"占位（或
+ * "[Interactive Card]" + card_id 引用），那不是正文：合并转发里遇到这种子消息要显式标注
+ * 不可读，否则升级提示会被当成内容喂给模型。
+ */
+export function isUnreadableCardText(text: string): boolean {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+  return trimmed.includes("请升级至最新版本") || trimmed.startsWith(INTERACTIVE_CARD_FALLBACK);
+}
+
 export function extractTextFromInteractiveCard(
   content: string,
   options?: { maxChars?: number },
@@ -179,6 +190,20 @@ export function extractTextFromInteractiveCard(
   return { text, attachments };
 }
 
+/**
+ * [patch:merge-forward-expand] 只清飞书自己的富文本标签 + @_user_N 占位。
+ * 刻意不做"删除一切 <…>"：子消息是任意用户内容，用户打的 `<T>`、`List<String>`、正则
+ * `<[^>]+>` 都会被无差别吃掉 —— 那是静默改写用户数据。白名单以外一律原样保留。
+ */
+export function stripFeishuMarkup(input: string, botOpenId?: string): string {
+  let text = String(input || "")
+    .replace(/<\/?(?:p|br|div|li)\b[^>]*\/?>/gi, "\n")
+    .replace(/<\/?(?:a|at|span|b|u|i|em|strong|code|pre)\b[^>]*\/?>/gi, "")
+    .replace(/@_user_[0-9]+/g, "");
+  if (botOpenId) text = text.replace(new RegExp(`@?${botOpenId}`, "g"), "");
+  return text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /** 将任意消息类型 content 尽量解析为文本（用于父消息展开） */
 export function extractTextFromMsgType(
   msgType: string,
@@ -189,6 +214,11 @@ export function extractTextFromMsgType(
   if (msgType === "interactive") {
     return extractTextFromInteractiveCard(content);
   }
+  // [patch:merge-forward-expand] 合并转发本体 content 固定是 "Merged and Forwarded Message"，
+  // 真内容在 items[1:]，只有异步路径能取到；同步兜底给一句明确占位，不要假装它是正文。
+  if (msgType === "merge_forward") {
+    return { text: "[合并转发消息（未能展开子消息）]", attachments };
+  }
   try {
     const json = JSON.parse(content || "{}");
     if (msgType === "text") {
@@ -198,7 +228,11 @@ export function extractTextFromMsgType(
     }
     if (msgType === "post") {
       const post = json.post || json;
-      const locale = post.zh_cn || post.en_us || Object.values(post).find((v) => isRecord(v) && Array.isArray((v as any).content));
+      // [patch:quoted-post] GET /im/v1/messages 对 post 返回扁平 {title,content}，原逻辑只认 zh_cn/en_us 包装，
+      // 会把引用到的 post 解析成空文本，导致整条引用被丢弃。
+      const locale = post.zh_cn || post.en_us
+        || (isRecord(post) && Array.isArray((post as any).content) ? post : undefined)
+        || Object.values(post).find((v) => isRecord(v) && Array.isArray((v as any).content));
       const parts: string[] = [];
       if (isRecord(locale)) {
         if (typeof locale.title === "string" && locale.title.trim()) parts.push(locale.title.trim());
